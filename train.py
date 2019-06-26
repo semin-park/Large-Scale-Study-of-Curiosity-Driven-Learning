@@ -19,6 +19,9 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument('-b', '--batch-size', default=32, type=int, help="Batch size")
 parser.add_argument('-g', '--gamma', default=0.99, type=float, help="Gamma")
+parser.add_argument('-r', '--random', default=True, type=bool, help="Use random features")
+parser.add_argument('-n', '--name', default='graph.png', type=str, help="Name of the graph (must append .png, .jpeg etc)")
+parser.add_argument('-e', '--env', default='PongNoFrameskip-v4', type=str, help="Name of the environment to use")
 
 
 class Trainer:
@@ -245,12 +248,15 @@ class Trainer:
 if __name__ == '__main__':
     args = parser.parse_args()
 
+    env_name      = args.env
     batch_size    = args.batch_size
     gamma         = args.gamma
+    use_random    = args.random
+    graph_name    = args.name
 
     # force
     batch_size = 16
     T_max = 100000000 # 100M steps
 
-    trainer = Trainer(env_name="PongNoFrameskip-v4", batch_size=batch_size, gamma=gamma, use_random_features=True)
-    trainer.train(T_max, "OnlyCuriosityBN")
+    trainer = Trainer(env_name=env_name, batch_size=batch_size, gamma=gamma, use_random_features=use_random)
+    trainer.train(T_max, graph_name)
