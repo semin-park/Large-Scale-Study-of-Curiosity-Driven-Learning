@@ -123,12 +123,12 @@ class ScaledFloatFrame(gym.ObservationWrapper):
     def observation(self, obs):
         return obs / 255.0
 
-def make_env(env_name='PongNoFrameskip-v4', skip=4, is_train=True):
+def make_env(env_name='PongNoFrameskip-v4', size=42, skip=4, is_train=True):
     env = gym.make(env_name)
     env = NoopResetEnv(env, noop_max=300)
     if is_train:
         env = MaxAndSkipEnv(env, skip=skip)
-    env = WarpFrame(env, width=42, height=42, grayscale=True) # obs_space is now (42,42,1)
+    env = WarpFrame(env, width=size, height=size, grayscale=True) # obs_space is now (84,84,1)
     env = ScaledFloatFrame(env)
     env = ChannelFirstFrameStack(env, 4)
     return env

@@ -1,7 +1,7 @@
 import torch, numpy as np
 import matplotlib.pyplot as plt
 
-def plot(step, score, int_reward, ext_reward, ploss, vloss, entropy, name):
+def plot(step, score, int_reward, ploss, vloss, entropy, name):
     plt.figure(figsize=(20,10))
 
     plt.subplot(231)
@@ -11,25 +11,25 @@ def plot(step, score, int_reward, ext_reward, ploss, vloss, entropy, name):
     plt.plot(score)
     
     plt.subplot(232)
-    plt.title(f'intrinsic reward: {np.mean(int_reward[-1000:]):.4f} (mean of 1K)')
+    plt.title(f'intrinsic reward: {np.mean(int_reward[-1000:]):.4e} (mean of 1K)')
     plt.xlabel('# frames')
     plt.ylabel('reward')
     plt.plot(int_reward)
 
-    plt.subplot(235)
-    plt.title(f'extrinsic reward: {np.mean(ext_reward[-1000:]):.4f} (mean of 1K)')
-    plt.xlabel('# frames')
-    plt.ylabel('reward')
-    plt.plot(ext_reward)
+    # plt.subplot(235)
+    # plt.title(f'extrinsic reward: {np.mean(ext_reward[-1000:]):.4f} (mean of 1K)')
+    # plt.xlabel('# frames')
+    # plt.ylabel('reward')
+    # plt.plot(ext_reward)
 
     plt.subplot(233)
-    plt.title(f'ploss: {np.mean(ploss[-1000:]):.4f} (mean of 1K)')
+    plt.title(f'ploss: {np.mean(ploss[-1000:]):.4e} (mean of 1K)')
     plt.xlabel('# frames')
     plt.ylabel('ploss')
     plt.plot(ploss)
 
     plt.subplot(236)
-    plt.title(f'vloss: {np.mean(vloss[-1000:]):.4f} (mean of 1K)')
+    plt.title(f'vloss: {np.mean(vloss[-1000:]):.4e} (mean of 1K)')
     plt.xlabel('# frames')
     plt.ylabel('vloss')
     plt.plot(vloss)

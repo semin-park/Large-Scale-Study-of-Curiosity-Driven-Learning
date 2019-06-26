@@ -1,15 +1,17 @@
-import torch, torchvision
+import torch
 import numpy as np
+import datetime
 import os, sys, argparse
 from collections import deque
 from multiprocessing import Queue, RawArray
 from ctypes import c_uint8, c_float
+from baselines.common.mpi_moments import mpi_moments
+from baselines.common.running_mean_std import RunningMeanStd
 
 from tqdm import tqdm
 
-from network import Policy, IntrinsicCuriosityModule
+from network import Policy, FeatureEncoder, ForwardModel, InverseModel, IntrinsicCuriosityModule
 from wrapper import make_env
-from replay import ReplayMemory
 from util import plot
 from worker import Worker
 
@@ -17,41 +19,37 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument('-b', '--batch-size', default=32, type=int, help="Batch size")
 parser.add_argument('-g', '--gamma', default=0.99, type=float, help="Gamma")
-parser.add_argument('-t', '--tau', default=0.96, type=float, help="Tau for GAE")
 
 
 class Trainer:
-    def __init__(self, env_name, mode, batch_size, gamma, tau):
+    def __init__(self, env_name, batch_size, gamma, use_random_features):
 
-        assert mode.upper() in ['IDF', 'RANDOM']
-        self.mode = mode.upper()
+        self.random = use_random_features
         self.batch_size = batch_size # batch_size == number of envs
         
         self.queues = [Queue() for i in range(batch_size)]
         self.barrier = Queue() # use to block Trainer until all envs finish updating
         self.channel = Queue() # envs send their total scores after each episode
 
-        # sh_* variables are shared between processes
-        self.sh_state, self.sh_reward, self.sh_done  = self.init_shared()
-        self.workers = [
-            Worker(i, env_name, self.queues[i], self.barrier, self.channel, self.sh_state, self.sh_reward, self.sh_done) for i in range(batch_size)
-        ]
-        self.start_workers()
-
         tmp_env = make_env(env_name)
         self.c_in = tmp_env.observation_space.shape[0]
         self.num_actions = tmp_env.action_space.n
-        del tmp_env
+        mean, std = self.mean_std_from_random_agent(tmp_env, 10000)
+
+        # sh_state is shared between processes
+        self.sh_state  = self.init_shared(tmp_env.observation_space.shape)
+
+        self.workers = [
+            Worker(i, env_name, self.queues[i], self.barrier, self.channel, self.sh_state, mean, std) for i in range(batch_size)
+        ]
+        self.start_workers()
+
 
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.gamma  = gamma # reward discounting factor
-        self.tau    = tau   # for GAE (Generalized Advantage Estimation)
-        self.lmbda  = 0.1   # weight of the policy/value loss
-        self.beta   = 0.2   # beta: forward; (1 - beta): inverse loss
-        self.eta    = 0.01  # weight of intrinsic reward
 
         self.model  = Policy(self.c_in, self.num_actions).to(self.device)
-        self.icm    = IntrinsicCuriosityModule(self.c_in, self.num_actions).to(self.device)
+        self.icm    = IntrinsicCuriosityModule(self.c_in, self.num_actions, self.random).to(self.device)
 
         self.optim = torch.optim.Adam(
             list(self.model.parameters()) + list(self.icm.parameters()),
@@ -79,25 +77,31 @@ class Trainer:
         for i in range(self.batch_size):
             self.barrier.get()
 
-    def init_shared(self):
-        shape = (self.batch_size, 4, 42, 42) # fixed
+    def init_shared(self, obs_shape):
+        shape = (self.batch_size,) + obs_shape
 
         state = np.zeros(shape, dtype=np.float32)
         state = RawArray(c_float, state.reshape(-1))
         state = np.frombuffer(state, c_float).reshape(shape)
-
-        reward = np.zeros((self.batch_size, 1), dtype=np.float32)
-        reward = RawArray(c_float, reward)
-        reward = np.frombuffer(reward, c_float).reshape(self.batch_size, 1)
-
-        done = np.zeros((self.batch_size, 1), dtype=np.uint8)
-        done = RawArray(c_uint8, done)
-        done = np.frombuffer(done, c_uint8).reshape(self.batch_size, 1)
         
-        return state, reward, done
+        return state
+
+    @staticmethod
+    def mean_std_from_random_agent(env, steps):
+        obs = np.empty((steps,) + env.observation_space.shape, dtype=np.float32)
+        
+        env.reset()
+        for i in range(steps):
+            state, _, done, _ = env.step(env.action_space.sample())
+            obs[i] = np.array(state)
+            if done:
+                env.reset()
+        mean = np.mean(obs, 0)
+        std = np.std(obs, 0).mean()
+        return mean, std
     
     
-    def train(self, T_max):
+    def train(self, T_max, graph_name=None):
         step = 0
         self.num_lookahead = 5
         
@@ -110,11 +114,17 @@ class Trainer:
             'vloss': [],
             'score': [],
             'int_reward': [],
-            'ext_reward': [],
             'entropy': [],
+            'fwd_kl_div': [],
             'running_loss': 0
         }
 
+        # Running random actions for 10000 steps to gain rewards and obs used to normalize
+        for i in range(10000):
+            pass
+
+        reward_tracker = RunningMeanStd()
+        reward_buffer = np.empty((self.batch_size, self.num_lookahead),dtype=np.float32)
         while step < T_max:
 
             # these will keep tensors, which we'll use later for backpropagation
@@ -127,7 +137,6 @@ class Trainer:
             actions_pred  = []
             features      = []
             features_pred = []
-
 
             state = torch.from_numpy(self.sh_state).to(self.device)
 
@@ -150,39 +159,41 @@ class Trainer:
 
                 next_state = torch.from_numpy(self.sh_state).to(self.device)
                 s1, s1_pred, action_pred = self.icm(state, oh_action, next_state)
+                
 
-                ext_reward = torch.from_numpy(np.clip(self.sh_reward, a_min=-1, a_max=1)).to(self.device)
-                int_reward = 0.5 * self.eta * (s1.detach() - s1_pred.detach()).pow(2).sum(dim=1, keepdim=True)
-                reward = ext_reward + int_reward
-
-
-                done_mask = torch.tensor(1.0 - self.sh_done.astype(np.float32), dtype=torch.float).to(self.device)
-                value *= done_mask
+                with torch.no_grad():
+                    int_reward = 0.5 * (s1 - s1_pred).pow(2).sum(dim=1, keepdim=True)
+                reward_buffer[:, i] = int_reward.cpu().numpy().ravel()
 
                 state = next_state
 
                 # save variables for gradient descent
                 values.append(value)
                 log_probs.append(sampled_lp)
-                rewards.append(reward)
+                rewards.append(int_reward)
                 entropies.append(entropy)
 
-                actions.append(action.flatten())
-                actions_pred.append(action_pred)
+                if not self.random:
+                    actions.append(action.flatten())
+                    actions_pred.append(action_pred)
                 features.append(s1)
                 features_pred.append(s1_pred)
 
                 stat['entropy'].append(entropy.sum(dim=1).mean().item())
-                stat['int_reward'].append(int_reward.mean().item())
-                stat['ext_reward'].append(ext_reward.mean().item())
+                stat['fwd_kl_div'].append(torch.kl_div(s1_pred, s1).mean().item())
 
+            # may have to update reward_buffer with gamma first
+            reward_mean, reward_std, count =  mpi_moments(reward_buffer.ravel())
+            reward_tracker.update_from_moments(reward_mean, reward_std ** 2, count)
+            std = np.sqrt(reward_tracker.var)
+            rewards = [rwd / std for rwd in rewards]
+            for rwd in rewards:
+                stat['int_reward'].append(rwd.mean().item())
 
             state = torch.from_numpy(self.sh_state.astype(np.float32)).to(self.device)
             with torch.no_grad():
                 _, R = self.model(state) # R is the estimated return
             
-            done_mask = torch.tensor(1.0 - self.sh_done.astype(np.float32), dtype=torch.float).to(self.device)
-            R *= done_mask
             values.append(R)
 
             ploss = 0
@@ -190,7 +201,6 @@ class Trainer:
             fwd_loss = 0
             inv_loss = 0
 
-            # Generalized Advantage Estimation
             delta = torch.zeros((self.batch_size, 1), dtype=torch.float, device=self.device)
             for i in reversed(range(self.num_lookahead)):
                 R = rewards[i] + self.gamma * R
@@ -201,45 +211,46 @@ class Trainer:
                 ploss += -(log_probs[i] * delta + 0.01 * entropies[i]).mean() # beta = 0.01
 
                 fwd_loss += 0.5 * (features[i] - features_pred[i]).pow(2).sum(dim=1).mean()
-                inv_loss += self.cross_entropy(actions_pred[i], actions[i])
+                if not self.random:
+                    inv_loss += self.cross_entropy(actions_pred[i], actions[i])
 
-
-            while not self.channel.empty():
-                # print("Getting score: ", end="")
-                score = self.channel.get()
-                stat['score'].append(score)
-                # print(score, "| size:", len(stat['score']))
 
             self.optim.zero_grad()
-            loss = self.lmbda * (ploss + 0.5 * vloss) + self.beta * fwd_loss + (1 - self.beta) * inv_loss
+
+            # inv_loss is 0 if using random features
+            loss = ploss + vloss + fwd_loss + inv_loss # 2018 Large scale curiosity paper simply sums them (no lambda and beta anymore)
             loss.backward()
 
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 40)
-
+            torch.nn.utils.clip_grad_norm_(list(self.model.parameters()) + list(self.icm.parameters()), 40)
             self.optim.step()
+
+            while not self.channel.empty():
+                score = self.channel.get()
+                stat['score'].append(score)
+
 
             stat['ploss'].append(ploss.item() / self.num_lookahead)
             stat['vloss'].append(vloss.item() / self.num_lookahead)
             stat['running_loss'] = 0.99 * stat['running_loss'] + 0.01 * loss.item() / self.num_lookahead
 
             if len(stat['score']) > 20 and step % (self.batch_size * 1000) == 0:
-                print(f"Step {step} | Running loss: {stat['running_loss']:.2f} | Running score: {np.mean(stat['score'][-10:]):.2f}")
-                if step % (self.batch_size * 50000) == 0:
-                    plot(step, stat['score'], stat['int_reward'], stat['ext_reward'], stat['ploss'], stat['vloss'], stat['entropy'], name="CuriosityBN.png")
+                now = datetime.datetime.now().strftime("%H:%M")
+                print(
+                    f"Step {step: <10} | Running loss: {stat['running_loss']:.4f} | Running score: {np.mean(stat['score'][-10:]):.2f} | Time: {now}"
+                )
+                if graph_name is not None and step % (self.batch_size * 10000) == 0:
+                    plot(step, stat['score'], stat['int_reward'], stat['ploss'], stat['vloss'], stat['entropy'], name=graph_name)
         
 
 if __name__ == '__main__':
-    env = make_env('PongNoFrameskip-v4')
     args = parser.parse_args()
 
     batch_size    = args.batch_size
     gamma         = args.gamma
-    tau           = args.tau
 
     # force
     batch_size = 16
-    T_max = 8000000 # 20M steps
+    T_max = 100000000 # 100M steps
 
-
-    trainer = Trainer(env_name="PongNoFrameskip-v4", mode="IDF", batch_size=batch_size, gamma=gamma, tau=tau)
-    trainer.train(T_max)
+    trainer = Trainer(env_name="PongNoFrameskip-v4", batch_size=batch_size, gamma=gamma, use_random_features=True)
+    trainer.train(T_max, "OnlyCuriosityBN")

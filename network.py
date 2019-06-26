@@ -105,16 +105,21 @@ class ForwardModel(torch.nn.Module):
 
 
 class IntrinsicCuriosityModule(torch.nn.Module):
-    def __init__(self, c_in, num_actions):
+    def __init__(self, c_in, num_actions, use_random_features):
         super(IntrinsicCuriosityModule, self).__init__()
+        self.random = use_random_features
         self.encoder = FeatureEncoder(c_in)
-        self.inv_model = InverseModel(self.encoder.num_features, num_actions)
+        if self.random:
+            self.encoder.eval()
+        else:
+            self.inv_model = InverseModel(self.encoder.num_features, num_actions)
         self.fwd_model = ForwardModel(self.encoder.num_features, num_actions)
 
     def forward(self, x0, a, x1):
         # x0, x1: (batch_size, 4, 42, 42), a: (batch_size, num_actions)
-        s0 = self.encoder(x0)
-        s1 = self.encoder(x1)
-        action_pred = self.inv_model(s0, s1)
+        with torch.set_grad_enabled(not self.random):
+            s0 = self.encoder(x0)
+            s1 = self.encoder(x1)
+        action_pred = self.inv_model(s0, s1) if not self.random else None
         s1_pred = self.fwd_model(s0, a)
         return s1, s1_pred, action_pred
