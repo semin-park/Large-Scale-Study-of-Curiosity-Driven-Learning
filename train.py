@@ -122,10 +122,6 @@ class Trainer:
             'running_loss': 0
         }
 
-        # Running random actions for 10000 steps to gain rewards and obs used to normalize
-        for i in range(10000):
-            pass
-
         reward_tracker = RunningMeanStd()
         reward_buffer = np.empty((self.batch_size, self.num_lookahead),dtype=np.float32)
         while step < T_max:
