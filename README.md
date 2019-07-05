@@ -3,7 +3,7 @@ PyTorch implementation of the paper "Large-Scale Study of Curiosity-Driven Learn
 
 X axes for below graphs are inaccurate. Will update it soon.
 
-Pong, random features, 16 environments
+Pong, random features, 32 environments
 ![Pong with random features](https://github.com/SPark9625/Large-Scale-Study-of-Curiosity-Driven-Learning/blob/master/resource/random-batch32.png)
 
 Pong, IDF, 16 environments
